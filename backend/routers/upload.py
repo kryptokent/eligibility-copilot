@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -185,79 +186,83 @@ async def upload_document(file: UploadFile = File(...)):
     """
     Accept a PDF, save it temporarily, run Textract OCR, and return extracted text + metadata.
     """
-    if not file:
-        raise HTTPException(status_code=400, detail="No file was provided.")
-
-    filename_original = file.filename or ""
-    content_type = (file.content_type or "").lower()
-
-    if content_type != "application/pdf" and not filename_original.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    _cleanup_old_uploads()
-    _ensure_uploads_dir()
-
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(pdf_bytes) > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is too large for this demo (max {MAX_FILE_BYTES // (1024 * 1024)} MB).",
-        )
-
-    document_id = str(uuid.uuid4())
-    safe_name = _safe_filename(filename_original)
-    stored_filename = f"{document_id}_{safe_name}"
-    stored_path = UPLOADS_DIR / stored_filename
-
     try:
-        stored_path.write_bytes(pdf_bytes)
-    except OSError:
-        raise HTTPException(status_code=500, detail="Failed to save the uploaded file on the server.")
+        if not file:
+            raise HTTPException(status_code=400, detail="No file was provided.")
 
-    # Page count (best-effort)
-    try:
-        reader = PdfReader(str(stored_path))
-        page_count = len(reader.pages)
-    except Exception:
-        page_count = None
+        filename_original = file.filename or ""
+        content_type = (file.content_type or "").lower()
 
-    # Textract OCR
-    try:
-        extracted_text = _textract_extract_text(pdf_bytes)
-    except RuntimeError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "AWS Textract failed to process this PDF. "
-                f"Details: {str(e)}"
-            ),
-        )
+        if content_type != "application/pdf" and not filename_original.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    detected_language = _detect_language(extracted_text)
+        _cleanup_old_uploads()
+        _ensure_uploads_dir()
 
-    # Persist extracted text for later governance reporting.
-    try:
-        _ensure_documents_schema()
-        with _get_connection() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO documents (document_id, filename, extracted_text, detected_language)
-                VALUES (?, ?, ?, ?)
-                """,
-                (document_id, stored_filename, extracted_text, detected_language),
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        if len(pdf_bytes) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File is too large for this demo (max {MAX_FILE_BYTES // (1024 * 1024)} MB).",
             )
-            conn.commit()
-    except sqlite3.Error:
-        # Best-effort; don't block the main upload flow.
-        pass
 
-    return {
-        "document_id": document_id,
-        "filename": stored_filename,
-        "page_count": page_count,
-        "detected_language": detected_language,
-        "extracted_text": extracted_text,
-    }
+        document_id = str(uuid.uuid4())
+        safe_name = _safe_filename(filename_original)
+        stored_filename = f"{document_id}_{safe_name}"
+        stored_path = UPLOADS_DIR / stored_filename
+
+        try:
+            stored_path.write_bytes(pdf_bytes)
+        except OSError:
+            raise HTTPException(status_code=500, detail="Failed to save the uploaded file on the server.")
+
+        # Page count (best-effort)
+        try:
+            reader = PdfReader(str(stored_path))
+            page_count = len(reader.pages)
+        except Exception:
+            page_count = None
+
+        # Textract OCR
+        try:
+            extracted_text = _textract_extract_text(pdf_bytes)
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "AWS Textract failed to process this PDF. "
+                    f"Details: {str(e)}"
+                ),
+            )
+
+        detected_language = _detect_language(extracted_text)
+
+        # Persist extracted text for later governance reporting.
+        try:
+            _ensure_documents_schema()
+            with _get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO documents (document_id, filename, extracted_text, detected_language)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (document_id, stored_filename, extracted_text, detected_language),
+                )
+                conn.commit()
+        except sqlite3.Error:
+            # Best-effort; don't block the main upload flow.
+            pass
+
+        return {
+            "document_id": document_id,
+            "filename": stored_filename,
+            "page_count": page_count,
+            "detected_language": detected_language,
+            "extracted_text": extracted_text,
+        }
+    except Exception:
+        traceback.print_exc()
+        raise
 
