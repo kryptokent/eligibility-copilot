@@ -1,5 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 
+const API_BASE = import.meta.env.VITE_API_URL
+
 function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
@@ -45,7 +47,7 @@ function App() {
       const formData = new FormData()
       formData.append('file', file)
 
-      const response = await fetch('http://localhost:8000/api/upload-document', {
+      const response = await fetch(`${API_BASE}/api/upload-document`, {
         method: 'POST',
         body: formData,
       })
@@ -75,7 +77,7 @@ function App() {
 
       // Immediately call the eligibility analysis endpoint with the extracted text.
       if (data?.extracted_text) {
-        const analyzeResp = await fetch('http://localhost:8000/api/analyze-document', {
+        const analyzeResp = await fetch(`${API_BASE}/api/analyze-document`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -111,7 +113,7 @@ function App() {
       }
     } catch (err) {
       setError(
-        'Unable to reach the document analysis service. Please confirm the backend is running on http://localhost:8000.',
+        `Unable to reach the document analysis service. Please confirm the backend is available at ${API_BASE}.`,
       )
     } finally {
       setIsLoading(false)
@@ -186,7 +188,7 @@ function App() {
     setIsGeneratingGovernance(true)
 
     try {
-      const resp = await fetch('http://localhost:8000/api/generate-governance-report', {
+      const resp = await fetch(`${API_BASE}/api/generate-governance-report`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -216,7 +218,7 @@ function App() {
       const data = await resp.json()
       setGovernanceReport(data)
     } catch (e) {
-      setError('Unable to reach the governance report service on http://localhost:8000.')
+      setError(`Unable to reach the governance report service at ${API_BASE}.`)
     } finally {
       setIsGeneratingGovernance(false)
     }
@@ -425,7 +427,7 @@ function App() {
                   }))
 
                   try {
-                    const resp = await fetch('http://localhost:8000/api/log-override', {
+                    const resp = await fetch(`${API_BASE}/api/log-override`, {
                       method: 'POST',
                       headers: {
                         'Content-Type': 'application/json',
@@ -470,7 +472,7 @@ function App() {
                       }))
                     }
                   } catch (e) {
-                    setError('Unable to reach the override logging service on http://localhost:8000.')
+                    setError(`Unable to reach the override logging service at ${API_BASE}.`)
                   } finally {
                     setOverrideState((prev) => ({
                       ...prev,
