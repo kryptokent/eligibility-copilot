@@ -126,42 +126,112 @@ def _detect_language(text: str) -> str:
     return "spanish" if hits >= 6 else "english"
 
 
-def _textract_extract_text(pdf_bytes: bytes) -> str:
+def _textract_extract_text(document_bytes: bytes, *, s3_key_hint: str | None = None) -> str:
     """
-    Extract text using AWS Textract, with credentials read directly from backend/.env.
+    Extract text using AWS Textract.
 
-    Note: Textract APIs evolve; for this demo we try DetectDocumentText with bytes.
-    If Textract rejects the file, we raise a clear error message for the UI.
+    Textract's synchronous DetectDocumentText often rejects PDFs with
+    UnsupportedDocumentException. When that happens, we switch to asynchronous
+    StartDocumentTextDetection + GetDocumentTextDetection (requires S3).
     """
     config = _config
 
-    client = boto3.client(
+    textract = boto3.client(
         "textract",
         region_name=config.get("AWS_DEFAULT_REGION", "us-east-1"),
         aws_access_key_id=config.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=config.get("AWS_SECRET_ACCESS_KEY"),
     )
 
+    blocks: list[dict] = []
     try:
-        resp = client.detect_document_text(Document={"Bytes": pdf_bytes})
+        # Always send bytes correctly for synchronous OCR attempts.
+        resp = textract.detect_document_text(Document={"Bytes": document_bytes})
+        blocks = resp.get("Blocks", []) or []
     except (ClientError, BotoCoreError) as e:
-        # Surface a readable error for the frontend.
         msg = str(e)
+        code = None
         if isinstance(e, ClientError):
             err = e.response.get("Error", {})
             code = err.get("Code")
-            if code == "UnsupportedDocumentException":
-                msg = (
-                    "This document format is not supported. "
-                    "Please upload a standard PDF under 5MB that is not password protected."
-                )
-            else:
+
+        # If it's not UnsupportedDocumentException, surface the underlying error.
+        if code != "UnsupportedDocumentException":
+            if isinstance(e, ClientError):
+                err = e.response.get("Error", {})
                 message = err.get("Message")
                 if code or message:
                     msg = f"{code or 'TextractError'}: {message or ''}".strip()
-        raise RuntimeError(msg) from e
+            raise RuntimeError(msg) from e
 
-    blocks = resp.get("Blocks", []) or []
+        # Async fallback for PDFs (requires an S3 bucket).
+        bucket = config.get("TEXTRACT_S3_BUCKET") or config.get("AWS_TEXTRACT_S3_BUCKET")
+        prefix = (config.get("TEXTRACT_S3_PREFIX") or "textract-uploads").strip("/")
+        if not bucket:
+            raise RuntimeError(
+                "Textract rejected this PDF via the synchronous API. "
+                "To process PDFs reliably, configure TEXTRACT_S3_BUCKET for async Textract OCR."
+            ) from e
+
+        s3 = boto3.client(
+            "s3",
+            region_name=config.get("AWS_DEFAULT_REGION", "us-east-1"),
+            aws_access_key_id=config.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=config.get("AWS_SECRET_ACCESS_KEY"),
+        )
+
+        safe_hint = re.sub(r"[^A-Za-z0-9._-]+", "_", (s3_key_hint or "document.pdf"))[:80]
+        object_key = f"{prefix}/{uuid.uuid4()}_{safe_hint}"
+
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=object_key,
+                Body=document_bytes,
+                ContentType="application/pdf",
+            )
+
+            start = textract.start_document_text_detection(
+                DocumentLocation={"S3Object": {"Bucket": bucket, "Name": object_key}}
+            )
+            job_id = start.get("JobId")
+            if not job_id:
+                raise RuntimeError("Textract async job did not return a JobId.")
+
+            max_wait_seconds = int(config.get("TEXTRACT_POLL_MAX_SECONDS") or 120)
+            sleep_seconds = 1.0
+            waited = 0.0
+            status = "IN_PROGRESS"
+
+            while status == "IN_PROGRESS" and waited < max_wait_seconds:
+                time.sleep(sleep_seconds)
+                waited += sleep_seconds
+                sleep_seconds = min(sleep_seconds * 1.5, 5.0)
+
+                status_resp = textract.get_document_text_detection(JobId=job_id, MaxResults=1)
+                status = status_resp.get("JobStatus") or "IN_PROGRESS"
+
+            if status != "SUCCEEDED":
+                raise RuntimeError(f"Textract async OCR did not succeed (status={status}).")
+
+            next_token = None
+            while True:
+                page = (
+                    textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
+                    if next_token
+                    else textract.get_document_text_detection(JobId=job_id)
+                )
+                blocks.extend(page.get("Blocks", []) or [])
+                next_token = page.get("NextToken")
+                if not next_token:
+                    break
+        except (ClientError, BotoCoreError) as async_err:
+            raise RuntimeError(f"Textract async OCR failed: {async_err}") from async_err
+        finally:
+            try:
+                s3.delete_object(Bucket=bucket, Key=object_key)
+            except Exception:
+                pass
     lines_by_page: dict[int, list[str]] = {}
     for b in blocks:
         if b.get("BlockType") != "LINE":
@@ -227,7 +297,7 @@ async def upload_document(file: UploadFile = File(...)):
 
         # Textract OCR
         try:
-            extracted_text = _textract_extract_text(pdf_bytes)
+            extracted_text = _textract_extract_text(pdf_bytes, s3_key_hint=stored_filename)
         except RuntimeError as e:
             raise HTTPException(
                 status_code=502,

@@ -24,15 +24,15 @@ if ENV_PATH.exists():
 
 app = FastAPI(title="Eligibility Copilot API")
 
-# Allow the React app (running on port 5173) to call this API from the browser.
+# Browser CORS: with allow_credentials=True you must list explicit origins — not "*".
+# Vercel preview URLs are matched via allow_origin_regex.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "https://eligibility-copilot.vercel.app",
-        "https://*.vercel.app",
-        "*",
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

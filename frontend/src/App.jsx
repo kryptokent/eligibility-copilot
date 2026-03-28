@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_URL
+const API_BASE = 'https://eligibility-copilot-1.onrender.com'
 
 function App() {
   const [isDragging, setIsDragging] = useState(false)

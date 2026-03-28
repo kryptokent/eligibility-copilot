@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -13,13 +16,16 @@ from dotenv import dotenv_values
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-# Load config from .env if present (local dev); otherwise use os.environ (e.g. production)
-_env_path = Path(__file__).resolve().parent.parent / ".env"
-_config = dotenv_values(_env_path) if _env_path.exists() else dict(os.environ)
+logger = logging.getLogger(__name__)
 
-_aws_region = _config.get("AWS_DEFAULT_REGION", "us-east-1")
-_aws_key = _config.get("AWS_ACCESS_KEY_ID")
-_aws_secret = _config.get("AWS_SECRET_ACCESS_KEY")
+# Merge process env with .env so platform secrets (e.g. Render) work, and local .env can override when set.
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+_env_from_file = dotenv_values(_env_path) if _env_path.exists() else {}
+_config: Dict[str, Optional[str]] = {**dict(os.environ), **{k: v for k, v in _env_from_file.items() if v}}
+
+_aws_region = (_config.get("AWS_DEFAULT_REGION") or "us-east-1").strip()
+_aws_key = (_config.get("AWS_ACCESS_KEY_ID") or "").strip() or None
+_aws_secret = (_config.get("AWS_SECRET_ACCESS_KEY") or "").strip() or None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 PARITY_DB_PATH = BASE_DIR / "overrides.db"
@@ -106,6 +112,62 @@ def _ensure_parity_schema() -> None:
         conn.commit()
 
 
+def _extract_json_object_from_text(text: str) -> Optional[dict]:
+    """Parse a JSON object from model output, including optional ```json fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        while lines and lines[-1].strip() in ("```", ""):
+            lines.pop()
+        text = "\n".join(lines).strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            obj = json.loads(match.group())
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _extract_programs_payload(data: Any) -> dict:
+    """
+    Bedrock Claude Messages API returns assistant output in `content` blocks, not top-level `programs`.
+    Accept either shape and normalize to a dict that may contain `programs`.
+    """
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("programs"), list):
+        return data
+    content = data.get("content")
+    if isinstance(content, list):
+        texts: List[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(str(block.get("text") or ""))
+        combined = "\n".join(texts)
+        extracted = _extract_json_object_from_text(combined)
+        if extracted and isinstance(extracted.get("programs"), list):
+            return extracted
+    return {}
+
+
+def _bedrock_runtime_client():
+    """Build client; only pass explicit keys when set so boto3 default chain works (e.g. IAM role)."""
+    kwargs: dict = {"region_name": _aws_region}
+    if _aws_key and _aws_secret:
+        kwargs["aws_access_key_id"] = _aws_key
+        kwargs["aws_secret_access_key"] = _aws_secret
+    return boto3.client("bedrock-runtime", **kwargs)
+
+
 def _invoke_bedrock_for_checklist(
     extracted_text: str,
     response_language: Literal["english", "spanish"],
@@ -119,12 +181,7 @@ def _invoke_bedrock_for_checklist(
     if not extracted_text or not extracted_text.strip():
         raise ValueError("No extracted text was provided for analysis.")
 
-    client = boto3.client(
-        "bedrock-runtime",
-        region_name=_aws_region,
-        aws_access_key_id=_aws_key,
-        aws_secret_access_key=_aws_secret,
-    )
+    client = _bedrock_runtime_client()
 
     language_instruction = (
         "Write all explanations and missing_information values in clear English suitable for a front-line caseworker."
@@ -133,12 +190,16 @@ def _invoke_bedrock_for_checklist(
     )
 
     system_prompt = (
-        "You are an expert U.S. public benefits intake screener. "
-        "Given an intake document, you will assess likely eligibility for three programs: "
-        "SNAP (food assistance), Medicaid, and CHIP. "
-        "Base your assessment ONLY on the information in the document; if key data is missing, "
-        "respond with 'maybe' and explicitly list what data is missing.\n\n"
+        "You are a benefits eligibility specialist. Based on the document provided, you MUST make a clear determination for each program.\n\n"
+        "For SNAP in Texas: A household of 3 with gross monthly income under $2,311 is likely ELIGIBLE.\n"
+        "For Medicaid in Texas: Adults with income under 138% FPL may qualify. Children under 19 in households under 200% FPL qualify.\n"
+        "For CHIP in Texas: Children under 19 in households earning between 100-200% FPL qualify.\n\n"
+        'You must respond with "Eligible", "Not Eligible", or "Uncertain" for each program with a clear reason. '
+        "Do not say uncertain if you have enough information to make a determination.\n\n"
         f"{language_instruction}\n\n"
+        'In the JSON below, encode each determination in the "eligibility" field as exactly '
+        '"yes" (Eligible), "no" (Not Eligible), or "maybe" (Uncertain only when information is genuinely insufficient). '
+        "If key data is missing, use \"maybe\" and list what is needed in missing_information.\n\n"
         "Return your answer strictly as JSON with this exact shape:\n"
         "{\n"
         '  "programs": [\n'
@@ -163,15 +224,13 @@ def _invoke_bedrock_for_checklist(
     body = json.dumps(
         {
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1024,
+            "max_tokens": 4096,
             "temperature": 0,
+            "system": system_prompt,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": system_prompt},
-                        {"type": "text", "text": user_prompt},
-                    ],
+                    "content": [{"type": "text", "text": user_prompt}],
                 }
             ],
         }
@@ -179,12 +238,13 @@ def _invoke_bedrock_for_checklist(
 
     try:
         response = client.invoke_model(
-            modelId="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            modelId="us.anthropic.claude-sonnet-4-20250514-v1:0",
             contentType="application/json",
             accept="application/json",
             body=body,
         )
     except (ClientError, BotoCoreError) as e:
+        traceback.print_exc()
         msg = str(e)
         if isinstance(e, ClientError):
             err = e.response.get("Error", {})
@@ -193,6 +253,9 @@ def _invoke_bedrock_for_checklist(
             if code or message:
                 msg = f"{code or 'BedrockError'}: {message or ''}".strip()
         raise RuntimeError(msg) from e
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise RuntimeError(f"Unexpected error calling Bedrock: {e}") from e
 
     try:
         raw = response.get("body")
@@ -200,11 +263,25 @@ def _invoke_bedrock_for_checklist(
             raw = raw.read()
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
-        data = json.loads(raw)
+        raw_str = raw if isinstance(raw, str) else str(raw)
+        print(f"[Bedrock] raw response body:\n{raw_str}")
+        logger.info("Bedrock raw response body: %s", raw_str)
+        data = json.loads(raw_str)
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
         raise RuntimeError(f"Failed to parse Bedrock response JSON: {e}") from e
 
-    programs = data.get("programs") or []
+    payload = _extract_programs_payload(data)
+    programs = payload.get("programs") or []
+    if not programs:
+        print(
+            "[Bedrock] No programs in parsed payload; top-level keys: "
+            f"{list(data.keys()) if isinstance(data, dict) else type(data)}"
+        )
+        logger.warning(
+            "Bedrock response had no programs after parsing; keys=%s",
+            list(data.keys()) if isinstance(data, dict) else None,
+        )
     checklist: List[_BedrockChecklist] = []
 
     for item in programs:
