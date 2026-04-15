@@ -712,6 +712,17 @@ function App() {
           </section>
         )}
       </main>
+
+      <footer className="mt-12 border-t border-slate-200 bg-white py-6 text-center text-sm text-slate-500">
+        Questions? Contact us at{' '}
+        <a
+          href="mailto:kent@thehentexgroup.com"
+          data-cfasync="false"
+          className="text-blue-600 hover:underline"
+        >
+          kent@thehentexgroup.com
+        </a>
+      </footer>
     </div>
   )
 }
