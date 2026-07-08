@@ -238,7 +238,7 @@ def _invoke_bedrock_for_checklist(
 
     try:
         response = client.invoke_model(
-            modelId="us.anthropic.claude-sonnet-4-20250514-v1:0",
+            modelId="us.anthropic.claude-haiku-4-5-20251001-v1:0",
             contentType="application/json",
             accept="application/json",
             body=body,
